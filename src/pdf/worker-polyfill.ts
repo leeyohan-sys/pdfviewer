@@ -18,11 +18,6 @@ if (typeof promiseCtor.withResolvers !== 'function') {
   }
 }
 
-if (typeof globalThis.structuredClone !== 'function') {
-  globalThis.structuredClone = <T>(value: T): T =>
-    JSON.parse(JSON.stringify(value)) as T
-}
-
 const mapProto = Map.prototype as Map<unknown, unknown> & {
   getOrInsert?: (key: unknown, value: unknown) => unknown
   getOrInsertComputed?: (

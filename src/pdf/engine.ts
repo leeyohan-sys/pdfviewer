@@ -8,16 +8,62 @@ import type {
   PDFPageProxy,
   RenderTask,
 } from 'pdfjs-dist'
-import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import workerSrc from './pdf.worker.ts?worker&url'
 
 GlobalWorkerOptions.workerSrc = workerSrc
 
 const pdfCache = new Map<string, PDFDocumentProxy>()
 
+function pdfjsAssetUrl(dir: string) {
+  const origin = globalThis.location?.origin ?? ''
+  return new URL(`${import.meta.env.BASE_URL}pdfjs/${dir}/`, `${origin}/`).href
+}
+
+function documentOptions(useWasm: boolean) {
+  return {
+    cMapUrl: pdfjsAssetUrl('cmaps'),
+    cMapPacked: true,
+    standardFontDataUrl: pdfjsAssetUrl('standard_fonts'),
+    wasmUrl: pdfjsAssetUrl('wasm'),
+    iccUrl: pdfjsAssetUrl('iccs'),
+    useWasm,
+    useWorkerFetch: useWasm,
+    stopAtErrors: false,
+    isEvalSupported: false,
+  }
+}
+
 export function copyBytes(bytes: Uint8Array): Uint8Array {
   const copy = new Uint8Array(bytes.byteLength)
   copy.set(bytes)
   return copy
+}
+
+export function isPdfBytes(bytes: Uint8Array): boolean {
+  const limit = Math.min(bytes.byteLength, 1024)
+  for (let i = 0; i <= limit - 5; i += 1) {
+    if (
+      bytes[i] === 0x25 &&
+      bytes[i + 1] === 0x50 &&
+      bytes[i + 2] === 0x44 &&
+      bytes[i + 3] === 0x46 &&
+      bytes[i + 4] === 0x2d
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+async function openWithPdfjs(
+  bytes: Uint8Array,
+  useSystemFonts: boolean,
+): Promise<PDFDocumentProxy> {
+  return getDocument({
+    data: copyBytes(bytes),
+    useSystemFonts,
+    ...documentOptions(false),
+  }).promise
 }
 
 export async function loadPdfDocument(
@@ -27,20 +73,33 @@ export async function loadPdfDocument(
   const existing = pdfCache.get(sourceId)
   if (existing) return existing
 
-  const data = copyBytes(bytes)
-  const pdf = await getDocument({
-    data,
-    useSystemFonts: true,
-  }).promise
-  pdfCache.set(sourceId, pdf)
-  return pdf
+  let lastError: unknown
+  for (const useSystemFonts of [true, false]) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const pdf = await openWithPdfjs(bytes, useSystemFonts)
+        pdfCache.set(sourceId, pdf)
+        return pdf
+      } catch (error) {
+        lastError = error
+        await new Promise((resolve) => window.setTimeout(resolve, 60))
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('PDF를 열지 못했습니다.')
 }
 
 export async function destroyPdfDocument(sourceId: string): Promise<void> {
   const pdf = pdfCache.get(sourceId)
   if (!pdf) return
   pdfCache.delete(sourceId)
-  await pdf.loadingTask.destroy()
+  try {
+    await pdf.loadingTask.destroy()
+  } catch {
+    // Worker may already be gone after a cancelled render.
+  }
 }
 
 export async function destroyAllPdfDocuments(): Promise<void> {
@@ -91,7 +150,12 @@ export async function renderPage(
 ): Promise<void> {
   const rotation = totalRotation(page.rotate, extraRotation)
   const viewport = page.getViewport({ scale, rotation })
-  const outputScale = window.devicePixelRatio || 1
+  const maxPixels = 16_000_000
+  let outputScale = Math.min(window.devicePixelRatio || 1, 2)
+  const pixelCount = viewport.width * viewport.height * outputScale * outputScale
+  if (pixelCount > maxPixels) {
+    outputScale = Math.sqrt(maxPixels / (viewport.width * viewport.height))
+  }
 
   canvas.width = Math.floor(viewport.width * outputScale)
   canvas.height = Math.floor(viewport.height * outputScale)

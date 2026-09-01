@@ -22,6 +22,9 @@ type ViewerProps = {
   onOrientationChange: (orientation: 'portrait' | 'landscape') => void
 }
 
+const MIN_ZOOM = 0.4
+const MAX_ZOOM = 4
+
 type Draft =
   | { type: 'highlight' | 'rect'; start: Point; current: Point }
   | { type: 'pen'; points: Point[] }
@@ -53,6 +56,16 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
     y: number
     radius: number
   } | null>(null)
+  const [baseWidth, setBaseWidth] = useState(0)
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>())
+  const pinchRef = useRef<{ distance: number; zoom: number } | null>(null)
+  const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(
+    null,
+  )
+  const pendingScroll = useRef<{ left: number; top: number } | null>(null)
+  const pinchActiveRef = useRef(false)
+  const zoomRef = useRef(editor.zoom)
+  zoomRef.current = editor.zoom
 
   const page = editor.currentPage
   const visual = page
@@ -73,22 +86,75 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
     const stage = stageRef.current
     if (!stage) return
     let lastWidth = stage.clientWidth
-    const observer = new ResizeObserver(() => {
+    const update = () => {
       const width = stage.clientWidth
+      const styles = getComputedStyle(stage)
+      const pad =
+        Number.parseFloat(styles.paddingLeft) +
+        Number.parseFloat(styles.paddingRight)
+      setBaseWidth(Math.max(8, width - pad))
       if (width !== lastWidth) {
         lastWidth = width
         setLayoutNonce((value) => value + 1)
       }
-    })
+    }
+    update()
+    const observer = new ResizeObserver(update)
     observer.observe(stage)
     return () => observer.disconnect()
   }, [page?.id])
 
   useLayoutEffect(() => {
+    const stage = stageRef.current
+    const next = pendingScroll.current
+    if (!stage || !next) return
+    stage.scrollLeft = next.left
+    stage.scrollTop = next.top
+    pendingScroll.current = null
+  }, [editor.zoom])
+
+  const applyZoom = (nextZoom: number, clientX: number, clientY: number) => {
+    const stage = stageRef.current
+    if (!stage) return
+    const current = zoomRef.current
+    const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, nextZoom))
+    if (Math.abs(clamped - current) < 0.001) return
+    const rect = stage.getBoundingClientRect()
+    const ratio = clamped / current
+    pendingScroll.current = {
+      left: (stage.scrollLeft + clientX - rect.left) * ratio - (clientX - rect.left),
+      top: (stage.scrollTop + clientY - rect.top) * ratio - (clientY - rect.top),
+    }
+    editor.setZoom(clamped)
+  }
+
+  useEffect(() => {
+    const stage = stageRef.current
+    if (!stage) return
+    const onWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return
+      event.preventDefault()
+      applyZoom(
+        zoomRef.current * (event.deltaY < 0 ? 1.08 : 0.92),
+        event.clientX,
+        event.clientY,
+      )
+    }
+    stage.addEventListener('wheel', onWheel, { passive: false })
+    return () => stage.removeEventListener('wheel', onWheel)
+  }, [])
+
+  useLayoutEffect(() => {
     if (!page || !visual) return
     const canvas = canvasRef.current
     const stack = stackRef.current
-    if (!canvas || !stack || stack.clientWidth < 8) return
+    if (!canvas || !stack) return
+    if (stack.clientWidth < 8) {
+      const frame = window.requestAnimationFrame(() => {
+        setLayoutNonce((value) => value + 1)
+      })
+      return () => window.cancelAnimationFrame(frame)
+    }
 
     let cancelled = false
     const source = editor.sources.find((item) => item.id === page.sourceId)
@@ -171,17 +237,65 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
     if (editor.tool !== 'eraser') setEraserCursor(null)
   }, [editor.tool])
 
+  const beginTwoFinger = () => {
+    pinchActiveRef.current = true
+    draftRef.current = null
+    setDraft(null)
+    dragRef.current = null
+    erasingRef.current = false
+    eraseAnnotationsRef.current = null
+    const points = [...pointersRef.current.values()]
+    if (points.length < 2) return
+    pinchRef.current = {
+      distance: Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y),
+      zoom: zoomRef.current,
+    }
+    const stage = stageRef.current
+    if (!stage) return
+    panRef.current = {
+      x: (points[0].x + points[1].x) / 2,
+      y: (points[0].y + points[1].y) / 2,
+      left: stage.scrollLeft,
+      top: stage.scrollTop,
+    }
+  }
+
   const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    if (!page || event.button !== 0) return
+    if (!page) return
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+
+    if (pointersRef.current.size >= 2) {
+      event.preventDefault()
+      beginTwoFinger()
+      return
+    }
+
+    if (!event.isPrimary) return
     const point = toPdf(event)
     if (!point) return
-    overlayRef.current?.setPointerCapture(event.pointerId)
+    if (editor.tool !== 'select') event.preventDefault()
+    try {
+      overlayRef.current?.setPointerCapture(event.pointerId)
+    } catch {
+      // iOS Safari can reject capture on some touch sequences.
+    }
 
     if (editor.tool === 'select') {
       const hit = [...page.annotations].reverse().find((annotation) => hitTest(annotation, point))
       editor.setSelectedId(hit?.id ?? null)
       if (hit) {
         dragRef.current = { id: hit.id, last: point, started: false }
+      } else if (event.pointerType !== 'mouse') {
+        const stage = stageRef.current
+        if (stage) {
+          panRef.current = {
+            x: event.clientX,
+            y: event.clientY,
+            left: stage.scrollLeft,
+            top: stage.scrollTop,
+          }
+        }
       }
       return
     }
@@ -248,6 +362,58 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
   }
 
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (pointersRef.current.has(event.pointerId)) {
+      pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    }
+
+    if (pointersRef.current.size >= 2) {
+      event.preventDefault()
+      if (!pinchRef.current) beginTwoFinger()
+      const points = [...pointersRef.current.values()]
+      const distance = Math.hypot(
+        points[0].x - points[1].x,
+        points[0].y - points[1].y,
+      )
+      const midX = (points[0].x + points[1].x) / 2
+      const midY = (points[0].y + points[1].y) / 2
+      if (pinchRef.current && pinchRef.current.distance >= 8) {
+        applyZoom(
+          (distance / pinchRef.current.distance) * pinchRef.current.zoom,
+          midX,
+          midY,
+        )
+      }
+      const stage = stageRef.current
+      if (stage && panRef.current && pinchRef.current) {
+        const zoomDelta = Math.abs(distance / pinchRef.current.distance - 1)
+        if (zoomDelta < 0.03) {
+          stage.scrollLeft = panRef.current.left - (midX - panRef.current.x)
+          stage.scrollTop = panRef.current.top - (midY - panRef.current.y)
+          panRef.current = {
+            x: midX,
+            y: midY,
+            left: stage.scrollLeft,
+            top: stage.scrollTop,
+          }
+        }
+      }
+      return
+    }
+
+    if (
+      panRef.current &&
+      !draftRef.current &&
+      !dragRef.current &&
+      !erasingRef.current
+    ) {
+      const stage = stageRef.current
+      if (stage) {
+        stage.scrollLeft = panRef.current.left - (event.clientX - panRef.current.x)
+        stage.scrollTop = panRef.current.top - (event.clientY - panRef.current.y)
+      }
+      return
+    }
+
     const point = toPdf(event)
     if (!point) return
 
@@ -298,7 +464,22 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
     }
   }
 
-  const onPointerUp = () => {
+  const onPointerUp = (event: PointerEvent<HTMLDivElement>) => {
+    pointersRef.current.delete(event.pointerId)
+    if (pointersRef.current.size < 2) {
+      pinchRef.current = null
+      panRef.current = null
+    }
+    if (pinchActiveRef.current) {
+      if (pointersRef.current.size === 0) pinchActiveRef.current = false
+      draftRef.current = null
+      setDraft(null)
+      dragRef.current = null
+      erasingRef.current = false
+      eraseAnnotationsRef.current = null
+      return
+    }
+
     dragRef.current = null
     erasingRef.current = false
     eraseAnnotationsRef.current = null
@@ -358,7 +539,7 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
           ref={stackRef}
           className="page-stack"
           style={{
-            maxWidth: `${Math.round(visual.width * editor.zoom)}px`,
+            width: `${Math.max((baseWidth || 1) * editor.zoom, 1)}px`,
             aspectRatio: `${visual.width} / ${visual.height}`,
           }}
         >
@@ -367,7 +548,10 @@ export function Viewer({ editor, onOrientationChange }: ViewerProps) {
           <div
             ref={overlayRef}
             className="page-overlay"
-            style={{ cursor: toolCursor(editor.tool) }}
+            style={{
+              cursor: toolCursor(editor.tool),
+              touchAction: 'none',
+            }}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
@@ -463,7 +647,7 @@ function boxFrame(viewport: PageViewport, annotation: BoxAnnotation) {
   }
 }
 
-function AnnotationShape({
+export function AnnotationShape({
   annotation,
   viewport,
   selected,

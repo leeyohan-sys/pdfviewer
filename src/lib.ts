@@ -1,11 +1,21 @@
 import type { Annotation, BoxAnnotation, Point, Tool } from './types'
 
 export function uid(prefix: string): string {
-  return `${prefix}_${crypto.randomUUID()}`
+  const cryptoObj = globalThis.crypto
+  if (typeof cryptoObj?.randomUUID === 'function') {
+    return `${prefix}_${cryptoObj.randomUUID()}`
+  }
+  if (typeof cryptoObj?.getRandomValues === 'function') {
+    const bytes = cryptoObj.getRandomValues(new Uint8Array(16))
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+    return `${prefix}_${hex}`
+  }
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`
 }
 
 export function clonePages<T>(value: T): T {
-  return structuredClone(value)
+  if (typeof structuredClone === 'function') return structuredClone(value)
+  return JSON.parse(JSON.stringify(value)) as T
 }
 
 export function normalizeBox(

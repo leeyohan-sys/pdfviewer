@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createBlankSource } from './pdf/createBlank'
 import {
-  destroyAllPdfDocuments,
+  destroyPdfDocument,
+  isPdfBytes,
   loadPdfDocument,
   visualPageSize,
 } from './pdf/engine'
@@ -45,7 +46,10 @@ export function usePdfEditor() {
   const undoStack = useRef<EditorSnapshot[]>([])
   const redoStack = useRef<EditorSnapshot[]>([])
   const skipHistory = useRef(false)
+  const sourcesRef = useRef<PdfSource[]>([])
+  const openTicket = useRef(0)
   const [, setHistoryTick] = useState(0)
+  sourcesRef.current = sources
 
   const currentPage = useMemo(
     () => pages.find((page) => page.id === currentPageId) ?? null,
@@ -73,30 +77,48 @@ export function usePdfEditor() {
     [currentPageId, pushHistory],
   )
 
-  const resetDocument = useCallback(async () => {
-    await destroyAllPdfDocuments()
-    undoStack.current = []
-    redoStack.current = []
-    setSources([])
-    setPages([])
-    setCurrentPageId('')
-    setSelectedId(null)
-    setTool('select')
-    setZoom(1)
-  }, [])
+  const adoptDocument = useCallback(
+    (source: PdfSource, nextPages: PageState[], name: string) => {
+      const previousIds = sourcesRef.current
+        .map((item) => item.id)
+        .filter((id) => id !== source.id)
+      undoStack.current = []
+      redoStack.current = []
+      setSources([source])
+      setPages(nextPages)
+      setCurrentPageId(nextPages[0]?.id ?? '')
+      setSelectedId(null)
+      setTool('select')
+      setZoom(1)
+      setFileName(name)
+      setPendingImage(null)
+      window.setTimeout(() => {
+        for (const id of previousIds) void destroyPdfDocument(id)
+      }, 80)
+    },
+    [],
+  )
 
   const openBytes = useCallback(
     async (bytes: Uint8Array, name: string) => {
+      const ticket = (openTicket.current += 1)
       setBusy(true)
       setStatus('문서를 여는 중…')
       try {
-        await resetDocument()
+        if (!isPdfBytes(bytes)) {
+          setStatus('PDF 파일이 아니거나 손상된 파일입니다.')
+          return
+        }
         const source: PdfSource = {
           id: uid('src'),
           name,
           bytes,
         }
         const pdf = await loadPdfDocument(source.id, source.bytes)
+        if (ticket !== openTicket.current) {
+          await destroyPdfDocument(source.id)
+          return
+        }
         const nextPages: PageState[] = []
         for (let index = 0; index < pdf.numPages; index += 1) {
           const pdfPage = await pdf.getPage(index + 1)
@@ -112,52 +134,69 @@ export function usePdfEditor() {
             annotations: [],
           })
         }
-        setSources([source])
-        setPages(nextPages)
-        setCurrentPageId(nextPages[0]?.id ?? '')
-        setFileName(name)
+        if (ticket !== openTicket.current) {
+          await destroyPdfDocument(source.id)
+          return
+        }
+        adoptDocument(source, nextPages, name)
         setStatus('')
       } catch (error) {
         console.error(error)
-        setStatus('PDF를 열지 못했습니다.')
+        const detail = error instanceof Error && error.message ? ` ${error.message}` : ''
+        setStatus(`PDF를 열지 못했습니다.${detail}`)
       } finally {
-        setBusy(false)
+        if (ticket === openTicket.current) setBusy(false)
       }
     },
-    [resetDocument],
+    [adoptDocument],
   )
 
   const openFile = useCallback(
     async (file: File) => {
-      const buffer = await file.arrayBuffer()
-      await openBytes(new Uint8Array(buffer), file.name)
+      let bytes: Uint8Array
+      try {
+        bytes = new Uint8Array(await file.arrayBuffer())
+      } catch {
+        bytes = await new Promise<Uint8Array>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => {
+            resolve(new Uint8Array(reader.result as ArrayBuffer))
+          }
+          reader.onerror = () => {
+            reject(reader.error ?? new Error('파일을 읽지 못했습니다.'))
+          }
+          reader.readAsArrayBuffer(file)
+        })
+      }
+      await openBytes(bytes, file.name || '문서.pdf')
     },
     [openBytes],
   )
 
   const newDocument = useCallback(
     async (count = 1, landscape = false) => {
+      const ticket = (openTicket.current += 1)
       setBusy(true)
       setStatus('새 문서를 만드는 중…')
       try {
-        await resetDocument()
         const { source, pages: nextPages } = await createBlankSource(
           count,
           landscape,
         )
-        setSources([source])
-        setPages(nextPages)
-        setCurrentPageId(nextPages[0]?.id ?? '')
-        setFileName(source.name)
+        if (ticket !== openTicket.current) {
+          await destroyPdfDocument(source.id)
+          return
+        }
+        adoptDocument(source, nextPages, source.name)
         setStatus('')
       } catch (error) {
         console.error(error)
         setStatus('새 문서를 만들지 못했습니다.')
       } finally {
-        setBusy(false)
+        if (ticket === openTicket.current) setBusy(false)
       }
     },
-    [resetDocument],
+    [adoptDocument],
   )
 
   const addBlankPage = useCallback(
@@ -374,14 +413,30 @@ export function usePdfEditor() {
     try {
       const bytes = await exportEditedPdf(sources, pages)
       const blob = new Blob([bytes.buffer as ArrayBuffer], { type: 'application/pdf' })
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
       const base = fileName.replace(/\.pdf$/i, '') || 'edited'
-      link.href = url
-      link.download = `${base}-편집.pdf`
-      link.click()
-      URL.revokeObjectURL(url)
-      setStatus('저장했습니다.')
+      const downloadName = `${base}-편집.pdf`
+      let shared = false
+      try {
+        const file = new File([blob], downloadName, { type: 'application/pdf' })
+        if (navigator.canShare?.({ files: [file] })) {
+          await navigator.share({ files: [file], title: downloadName })
+          shared = true
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          setStatus('')
+          return
+        }
+      }
+      if (!shared) {
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = downloadName
+        link.click()
+        URL.revokeObjectURL(url)
+      }
+      setStatus(shared ? '공유했습니다.' : '저장했습니다.')
     } catch (error) {
       console.error(error)
       setStatus('저장에 실패했습니다.')

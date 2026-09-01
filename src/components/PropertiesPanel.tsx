@@ -13,15 +13,21 @@ type Editor = ReturnType<typeof usePdfEditor>
 type PropertiesPanelProps = {
   editor: Editor
   orientation: 'portrait' | 'landscape' | null
+  onClose: () => void
 }
 
-export function PropertiesPanel({ editor, orientation }: PropertiesPanelProps) {
+export function PropertiesPanel({ editor, orientation, onClose }: PropertiesPanelProps) {
   const page = editor.currentPage
   const selected = editor.selectedAnnotation
 
   return (
     <aside className="props">
-      <h2>페이지 설정</h2>
+      <div className="props-sheet-head">
+        <h2>페이지 설정</h2>
+        <button type="button" className="props-close" onClick={onClose}>
+          닫기
+        </button>
+      </div>
       {page ? (
         <>
           <p className="props-label">방향</p>
@@ -72,7 +78,7 @@ export function PropertiesPanel({ editor, orientation }: PropertiesPanelProps) {
       )}
 
       <h2>도구 옵션</h2>
-      <p className="props-label">잉크 색</p>
+      <p className="props-label">펜 색</p>
       <div className="swatches">
         {INK_COLORS.map((color) => (
           <button

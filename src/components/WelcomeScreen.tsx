@@ -1,7 +1,13 @@
+import { useRef } from 'react'
+
 type WelcomeScreenProps = {
   busy: boolean
   onOpenFile: (file: File) => void
   onNewDocument: (count: number, landscape: boolean) => void
+}
+
+function isPdfFile(file: File) {
+  return file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
 }
 
 export function WelcomeScreen({
@@ -9,6 +15,8 @@ export function WelcomeScreen({
   onOpenFile,
   onNewDocument,
 }: WelcomeScreenProps) {
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   return (
     <div
       className="welcome"
@@ -16,7 +24,7 @@ export function WelcomeScreen({
       onDrop={(event) => {
         event.preventDefault()
         const file = event.dataTransfer.files[0]
-        if (file && file.type === 'application/pdf') onOpenFile(file)
+        if (file && isPdfFile(file)) onOpenFile(file)
       }}
     >
       <div className="welcome-card">
@@ -27,20 +35,25 @@ export function WelcomeScreen({
           페이지 단위로 방향을 바꿀 수 있습니다.
         </p>
         <div className="welcome-actions">
-          <label className="btn btn-primary">
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={busy}
+            onClick={() => fileInputRef.current?.click()}
+          >
             PDF 열기
-            <input
-              type="file"
-              accept="application/pdf"
-              hidden
-              disabled={busy}
-              onChange={(event) => {
-                const file = event.target.files?.[0]
-                if (file) onOpenFile(file)
-                event.target.value = ''
-              }}
-            />
-          </label>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf"
+            className="visually-hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) onOpenFile(file)
+              event.target.value = ''
+            }}
+          />
           <button
             type="button"
             className="btn"

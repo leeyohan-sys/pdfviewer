@@ -1,13 +1,10 @@
 import { PDFDocument } from 'pdf-lib'
+import { uid } from '../lib'
 import { loadPdfDocument } from './engine'
 import type { PageState, PdfSource } from '../types'
 
 const A4_PORTRAIT: [number, number] = [595.28, 841.89]
 const A4_LANDSCAPE: [number, number] = [841.89, 595.28]
-
-function uid(prefix: string): string {
-  return `${prefix}_${crypto.randomUUID()}`
-}
 
 export async function createBlankSource(
   count: number,
